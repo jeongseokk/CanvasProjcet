@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>glTF Viewer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #111;
+        color: #ddd;
+        font-family: Arial, sans-serif;
+      }
+      #overlay {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 8px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+      #canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="overlay">Click on model surface to add points</div>
+    <canvas id="canvas"></canvas>
+
+    <script src="https://unpkg.com/three@0.160.1/build/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.160.1/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://unpkg.com/three@0.160.1/examples/js/loaders/OBJLoader.js"></script>
+    <script src="https://unpkg.com/three@0.160.1/examples/js/controls/OrbitControls.js"></script>
+    <script>
+      const canvas = document.getElementById('canvas');
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.setPixelRatio(window.devicePixelRatio || 1);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x1a1a1a);
+      scene.add(new THREE.GridHelper(10, 10, 0x444444, 0x333333));
+      scene.add(new THREE.AxesHelper(1));
+
+      const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 10000);
+      camera.position.set(0, 0, 5);
+
+      const controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      const light1 = new THREE.DirectionalLight(0xffffff, 1.0);
+      light1.position.set(3, 3, 3);
+      scene.add(light1);
+      const light2 = new THREE.AmbientLight(0x666666);
+      scene.add(light2);
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x333333, 0.6);
+      scene.add(hemi);
+
+      const raycaster = new THREE.Raycaster();
+      const mouse = new THREE.Vector2();
+
+      let modelRoot = null;
+      let points = [];
+      let line = null;
+
+      function postMessage(obj) {
+        if (window.chrome && window.chrome.webview) {
+          window.chrome.webview.postMessage(JSON.stringify(obj));
+        }
+      }
+
+      function fitCameraToObject(obj) {
+        const box = new THREE.Box3().setFromObject(obj);
+        let size = box.getSize(new THREE.Vector3()).length();
+        const center = box.getCenter(new THREE.Vector3());
+        if (!isFinite(size) || size === 0) {
+          size = 1;
+        }
+        controls.target.copy(center);
+        const dir = new THREE.Vector3(1, 1, 1).normalize();
+        camera.position.copy(center.clone().add(dir.multiplyScalar(size)));
+        camera.near = size / 100;
+        camera.far = size * 10;
+        camera.updateProjectionMatrix();
+        camera.lookAt(center);
+        controls.update();
+        postMessage({ type: 'status', message: `BBox size: ${size.toFixed(4)}` });
+      }
+
+      function clearPoints() {
+        points = [];
+        if (line) {
+          scene.remove(line);
+          line.geometry.dispose();
+          line.material.dispose();
+          line = null;
+        }
+      }
+
+      function updateLine() {
+        if (line) {
+          scene.remove(line);
+          line.geometry.dispose();
+          line.material.dispose();
+        }
+        const geom = new THREE.BufferGeometry().setFromPoints(points);
+        const mat = new THREE.LineBasicMaterial({ color: 0xff3b3b });
+        line = new THREE.Line(geom, mat);
+        scene.add(line);
+      }
+
+      function addPoint(p) {
+        points.push(p.clone());
+        updateLine();
+        postMessage({ type: 'point', x: p.x, y: p.y, z: p.z });
+      }
+
+      function handleClick(event) {
+        if (!modelRoot) return;
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObject(modelRoot, true);
+        if (intersects.length > 0) {
+          addPoint(intersects[0].point);
+        }
+      }
+
+      renderer.domElement.addEventListener('pointerdown', handleClick);
+
+      function loadModel(url) {
+        const loader = new THREE.GLTFLoader();
+        loader.load(url, (gltf) => {
+          if (modelRoot) {
+            scene.remove(modelRoot);
+          }
+          modelRoot = gltf.scene;
+          scene.add(modelRoot);
+          fitCameraToObject(modelRoot);
+          clearPoints();
+          postMessage({ type: 'status', message: 'Model loaded' });
+        }, undefined, (error) => {
+          console.error(error);
+          postMessage({ type: 'error', message: error.message || String(error) });
+        });
+      }
+
+      window.loadModel = loadModel;
+      window.loadModelBase64 = (base64) => {
+        try {
+          const binary = atob(base64);
+          const len = binary.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          const loader = new THREE.GLTFLoader();
+          loader.parse(bytes.buffer, '', (gltf) => {
+            if (modelRoot) {
+              scene.remove(modelRoot);
+            }
+            modelRoot = gltf.scene;
+            scene.add(modelRoot);
+            fitCameraToObject(modelRoot);
+            clearPoints();
+            postMessage({ type: 'status', message: 'Model loaded' });
+          }, (error) => {
+            postMessage({ type: 'error', message: error.message || String(error) });
+          });
+        } catch (e) {
+          postMessage({ type: 'error', message: e.message || String(e) });
+        }
+      };
+      window.loadObjText = (text) => {
+        try {
+          const loader = new THREE.OBJLoader();
+          const obj = loader.parse(text);
+          if (modelRoot) {
+            scene.remove(modelRoot);
+          }
+          modelRoot = obj;
+          modelRoot.traverse((child) => {
+            if (child.isMesh) {
+              if (child.geometry && child.geometry.computeVertexNormals) {
+                child.geometry.computeVertexNormals();
+              }
+              child.material = new THREE.MeshStandardMaterial({
+                color: 0xd0d0d0,
+                metalness: 0.1,
+                roughness: 0.8
+              });
+              child.castShadow = false;
+              child.receiveShadow = false;
+            }
+          });
+          scene.add(modelRoot);
+          fitCameraToObject(modelRoot);
+          clearPoints();
+          postMessage({ type: 'status', message: 'OBJ loaded (materials not applied)' });
+        } catch (e) {
+          postMessage({ type: 'error', message: e.message || String(e) });
+        }
+      };
+      window.clearPoints = clearPoints;
+
+      function animate() {
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      window.addEventListener('resize', () => {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        renderer.setSize(w, h);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      });
+    </script>
+  </body>
+</html>

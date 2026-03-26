@@ -114,12 +114,14 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
   // ===== UI 입력 컨트롤러 =====
   final TextEditingController _hostController =
-      TextEditingController(text: _defaultHost);
+  TextEditingController(text: _defaultHost);
   final TextEditingController _portController =
-      TextEditingController(text: _defaultPort.toString());
+  TextEditingController(text: _defaultPort.toString());
   final TextEditingController _zController = TextEditingController(text: '0.0');
+  final TextEditingController _stepPxController =
+      TextEditingController(text: _defaultStepPx.toStringAsFixed(1));
   final TextEditingController _mmPerPxController =
-      TextEditingController(text: _defaultMmPerPx.toStringAsFixed(3));
+  TextEditingController(text: _defaultMmPerPx.toStringAsFixed(3));
   final TextEditingController _bgWidthController = TextEditingController();
   final TextEditingController _bgHeightController = TextEditingController();
 
@@ -128,6 +130,75 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   String? _connectedHost;
   int? _connectedPort;
   String _status = 'Ready';
+
+  Future<String> _networkDebugInfo() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.any,
+      );
+      final parts = <String>[];
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          parts.add('${iface.name}:${addr.address}');
+        }
+      }
+      if (parts.isEmpty) {
+        return 'interfaces=none';
+      }
+      return parts.join(', ');
+    } catch (error) {
+      return 'interfaces_error=$error';
+    }
+  }
+
+  List<int>? _tryParseIpv4(String value) {
+    final parts = value.split('.');
+    if (parts.length != 4) return null;
+    final bytes = <int>[];
+    for (final part in parts) {
+      final parsed = int.tryParse(part);
+      if (parsed == null || parsed < 0 || parsed > 255) {
+        return null;
+      }
+      bytes.add(parsed);
+    }
+    return bytes;
+  }
+
+  bool _same24Subnet(String a, String b) {
+    final aBytes = _tryParseIpv4(a);
+    final bBytes = _tryParseIpv4(b);
+    if (aBytes == null || bBytes == null) return false;
+    return aBytes[0] == bBytes[0] &&
+        aBytes[1] == bBytes[1] &&
+        aBytes[2] == bBytes[2];
+  }
+
+  Future<InternetAddress?> _selectSourceAddress(String host) async {
+    final hostBytes = _tryParseIpv4(host);
+    if (hostBytes == null) return null;
+
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+
+      InternetAddress? fallback;
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (_same24Subnet(addr.address, host)) {
+            return addr;
+          }
+          fallback ??= addr;
+        }
+      }
+      return fallback;
+    } catch (_) {
+      return null;
+    }
+  }
 
   @override
   void initState() {
@@ -142,11 +213,12 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     _mmPerPxController.text = _mmPerPx.toStringAsFixed(3);
   }
 
-  @override
+  @override   //dispose() 끝날 떄 정리, 메모리 누수 방지
   void dispose() {
     _hostController.dispose();
     _portController.dispose();
     _zController.dispose();
+    _stepPxController.dispose();
     _mmPerPxController.dispose();
     _bgWidthController.dispose();
     _bgHeightController.dispose();
@@ -166,6 +238,54 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     setState(() {
       _mmPerPx = value;
       _status = 'mm_per_px applied';
+    });
+  }
+
+  void _applyStepPx() {
+    final value = double.tryParse(_stepPxController.text.trim());
+    if (value == null || value <= 0) {
+      setState(() {
+        _status = 'Point spacing invalid';
+      });
+      return;
+    }
+
+    setState(() {
+      _stepPx = value;
+      if (_isDrawing || _p0 != null || _rawPoints.isNotEmpty) {
+        _rebuildPoints();
+      }
+      _status = 'Point spacing applied';
+    });
+  }
+
+  void _applyZToAll() {
+    final value = double.tryParse(_zController.text.trim());
+    if (value == null) {
+      setState(() {
+        _status = 'Z invalid';
+      });
+      return;
+    }
+
+    setState(() {
+      if (_strokes.isNotEmpty) {
+        if (_selectedStrokeIndex != null &&
+            _selectedStrokeIndex! >= 0 &&
+            _selectedStrokeIndex! < _strokes.length) {
+          final stroke = _strokes[_selectedStrokeIndex!];
+          stroke.zValues = List<double>.filled(stroke.samples.length, value);
+          _status = 'Applied Z to S$_selectedStrokeIndex';
+        } else {
+          for (final stroke in _strokes) {
+            stroke.zValues = List<double>.filled(stroke.samples.length, value);
+          }
+          _status = 'Applied Z to all strokes';
+        }
+      } else {
+        _currentZValues = List<double>.filled(_pointsMm.length, value);
+        _status = 'Applied Z to current points';
+      }
     });
   }
 
@@ -243,7 +363,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
         if (_appendPen && _strokes.isNotEmpty) {
           _appendStrokeIndex = _strokes.length - 1;
           final last =
-              _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
+          _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
           _p0 = last ?? startPos;
           _p1 = startPos;
         } else {
@@ -255,7 +375,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
         if (_mode == DrawMode.pen && _appendPen && _strokes.isNotEmpty) {
           _appendStrokeIndex = _strokes.length - 1;
           final last =
-              _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
+          _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
           if (last != null) {
             _rawPoints = <Offset>[last, _clampToFrame(event.localPosition)];
             _p0 = last;
@@ -480,11 +600,17 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       _connectedPort = null;
     }
     try {
+      final sourceAddress = await _selectSourceAddress(host);
       _status = 'Connecting to $host:$port...';
       setState(() {});
-      final socket = await Socket.connect(host, port);
+      final socket = await Socket.connect(
+        host,
+        port,
+        sourceAddress: sourceAddress,
+        timeout: const Duration(seconds: 3),
+      );
       socket.listen(
-        (data) {
+            (data) {
           final text = utf8.decode(data).trim();
           if (text.isNotEmpty) {
             setState(() {
@@ -508,11 +634,14 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       _connectedHost = host;
       _connectedPort = port;
       setState(() {
-        _status = 'Connected to $host:$port';
+        _status = sourceAddress == null
+            ? 'Connected to $host:$port'
+            : 'Connected to $host:$port via ${sourceAddress.address}';
       });
     } catch (error) {
+      final debugInfo = await _networkDebugInfo();
       setState(() {
-        _status = 'Connect failed: $error';
+        _status = 'Connect failed: $error | $debugInfo';
       });
       rethrow;
     }
@@ -523,8 +652,8 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     // 현재 그려진 포인트(또는 스트로크)를 JSON으로 직렬화해서 소켓 전송.
     if (_strokes.isEmpty) {
       if ((_mode == DrawMode.line ||
-              _mode == DrawMode.circle ||
-              _mode == DrawMode.rect) &&
+          _mode == DrawMode.circle ||
+          _mode == DrawMode.rect) &&
           (_p0 == null || _p1 == null)) {
         setState(() {
           _status = 'No line to send';
@@ -554,6 +683,14 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     }
   }
 
+  Future<void> _testConnection() async {
+    try {
+      await _ensureConnected();
+    } catch (_) {
+      // _ensureConnected already updates the status with diagnostics.
+    }
+  }
+
 ///////////////////////////////////////////Json////////////////////////////////////////////////////////////////////////
   // ✅ payload는 "표에 선택된 대상(Current 또는 Stroke)" 기준으로 보냄
   //    points: [[x,y,z], ...]
@@ -578,7 +715,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
     for (final stroke in _strokes) {
       final imagePoints =
-          stroke.samples.map(_canvasToImageClamped).toList(growable: false);
+      stroke.samples.map(_canvasToImageClamped).toList(growable: false);
       final pointsMm = _applyTransform(imagePoints, _mmPerPx);
       stroke.zValues = _syncZList(stroke.zValues, pointsMm.length);
       for (var i = 0; i < pointsMm.length; i++) {
@@ -633,8 +770,8 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     // 현재 모드에 맞는 포인트를 다시 생성하고
     // 이미지 좌표 -> 캔버스 좌표 -> mm 좌표까지 동기화한다.
     if ((_mode == DrawMode.line ||
-            _mode == DrawMode.circle ||
-            _mode == DrawMode.rect) &&
+        _mode == DrawMode.circle ||
+        _mode == DrawMode.rect) &&
         (_p0 == null || _p1 == null)) {
       _pointsPx = <Offset>[];
       _pointsImage = <Offset>[];
@@ -677,7 +814,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       points = _imagePointsToCanvas(pointsImage);
     } else {
       final rawImage =
-          _rawPoints.map(_canvasToImageClamped).toList(growable: false);
+      _rawPoints.map(_canvasToImageClamped).toList(growable: false);
       pointsImage = _resamplePolyline(rawImage, _stepPx);
       points = _imagePointsToCanvas(pointsImage);
     }
@@ -860,7 +997,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       ),
       ...List<DropdownMenuItem<int?>>.generate(
         _strokes.length,
-        (index) => DropdownMenuItem<int?>(
+            (index) => DropdownMenuItem<int?>(
           value: index,
           child: Text('S$index'),
         ),
@@ -916,21 +1053,21 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
           final maxHeight = constraints.maxHeight * 0.9;
           final frameSize = _useUserFrameOverride && _userFramePxSize != null
               ? (() {
-                  final scaledWidth = _userFramePxSize!.width * _userFrameScale;
-                  final scaledHeight =
-                      _userFramePxSize!.height * _userFrameScale;
-                  final scale = math.min(
-                    math.min(maxWidth / scaledWidth, maxHeight / scaledHeight),
-                    1.0,
-                  );
-                  return Size(
-                    scaledWidth * scale,
-                    scaledHeight * scale,
-                  );
-                })()
+            final scaledWidth = _userFramePxSize!.width * _userFrameScale;
+            final scaledHeight =
+                _userFramePxSize!.height * _userFrameScale;
+            final scale = math.min(
+              math.min(maxWidth / scaledWidth, maxHeight / scaledHeight),
+              1.0,
+            );
+            return Size(
+              scaledWidth * scale,
+              scaledHeight * scale,
+            );
+          })()
               : (_imageSize != null
-                  ? _fitFrameSize(_imageSize!, maxWidth, maxHeight)
-                  : Size(maxWidth, maxHeight));
+              ? _fitFrameSize(_imageSize!, maxWidth, maxHeight)
+              : Size(maxWidth, maxHeight));
           final frameLeft = (constraints.maxWidth - frameSize.width) / 2;
           final frameTop = (constraints.maxHeight - frameSize.height) / 2;
           _frameRect = Rect.fromLTWH(
@@ -963,11 +1100,11 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                   child: _imageFile == null
                       ? const Center(child: Text('No Image'))
                       : ClipRect(
-                          child: Image.file(
-                            _imageFile!,
-                            fit: BoxFit.contain,
-                          ),
-                        ),
+                    child: Image.file(
+                      _imageFile!,
+                      fit: BoxFit.contain,
+                    ),
+                  ),
                 ),
               ),
               Listener(
@@ -997,11 +1134,11 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   Widget _buildControlsPanel(
-    BuildContext context,
-    List<DropdownMenuItem<int?>> strokeItems,
-    double lengthPx, {
-    required bool isLandscape,
-  }) {
+      BuildContext context,
+      List<DropdownMenuItem<int?>> strokeItems,
+      double lengthPx, {
+        required bool isLandscape,
+      }) {
     final safeBottom = MediaQuery.of(context).padding.bottom;
     final titleStyle = Theme.of(context).textTheme.titleMedium;
     final panelDecoration = BoxDecoration(
@@ -1050,10 +1187,12 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         Text('Points Table', style: titleStyle),
-                        const SizedBox(width: 12),
                         DropdownButton<int?>(
                           value: _selectedStrokeIndex,
                           items: strokeItems,
@@ -1063,6 +1202,25 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                             });
                           },
                           isDense: true,
+                        ),
+                        SizedBox(
+                          width: 90,
+                          child: TextField(
+                            controller: _zController,
+                            keyboardType: const TextInputType.numberWithOptions(
+                              signed: true,
+                              decimal: true,
+                            ),
+                            decoration: const InputDecoration(
+                              labelText: 'Z All',
+                              isDense: true,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        ElevatedButton(
+                          onPressed: _applyZToAll,
+                          child: const Text('Apply Z All'),
                         ),
                       ],
                     ),
@@ -1116,18 +1274,6 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                         isDense: true,
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _zController,
-                      keyboardType: const TextInputType.numberWithOptions(
-                        signed: true,
-                        decimal: true,
-                      ),
-                      decoration: const InputDecoration(
-                        labelText: 'Z (mm)',
-                        isDense: true,
-                      ),
-                    ),
                   ],
                 ),
               ),
@@ -1144,6 +1290,10 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                           child: const Text('Reset'),
                         ),
                         ElevatedButton(
+                          onPressed: _testConnection,
+                          child: const Text('Test TCP'),
+                        ),
+                        ElevatedButton(
                           onPressed: _sendJson,
                           child: const Text('Send'),
                         ),
@@ -1156,77 +1306,98 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                           child: const Text('Upload'),
                         ),
                         ElevatedButton(
-                          onPressed: _openStepViewer,
-                          child: const Text('STEP Viewer'),
-                        ),
-                        ElevatedButton(
                           onPressed: _openOnshapeViewer,
                           child: const Text('Onshape'),
                         ),
                       ],
                     ),
                     const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      crossAxisAlignment: WrapCrossAlignment.center,
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          ToggleButtons(
+                            isSelected: [
+                              _mode == DrawMode.line,
+                              _mode == DrawMode.pen,
+                              _mode == DrawMode.circle,
+                              _mode == DrawMode.rect,
+                            ],
+                            onPressed: (index) {
+                              setState(() {
+                                _mode = DrawMode.values[index];
+                                _clearCurrentDrawing();
+                              });
+                            },
+                            children: const [
+                              Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12),
+                                child: Text('Line'),
+                              ),
+                              Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12),
+                                child: Text('Pen'),
+                              ),
+                              Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12),
+                                child: Text('Circle'),
+                              ),
+                              Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12),
+                                child: Text('Rect'),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(width: 8),
+                          FilterChip(
+                            label: const Text('Continue'),
+                            selected: _appendPen,
+                            onSelected: (value) {
+                              setState(() {
+                                _appendPen = value;
+                              });
+                            },
+                          ),
+                          const SizedBox(width: 8),
+                          FilterChip(
+                            label: const Text('Select'),
+                            selected: _selectMode,
+                            onSelected: (value) {
+                              setState(() {
+                                _selectMode = value;
+                                _isSelecting = false;
+                                _selectStart = null;
+                                _selectRect = null;
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text('Point Density', style: titleStyle),
+                    Row(
                       children: [
-                        ToggleButtons(
-                          isSelected: [
-                            _mode == DrawMode.line,
-                            _mode == DrawMode.pen,
-                            _mode == DrawMode.circle,
-                            _mode == DrawMode.rect,
-                          ],
-                          onPressed: (index) {
-                            setState(() {
-                              _mode = DrawMode.values[index];
-                              _clearCurrentDrawing();
-                            });
-                          },
-                          children: const [
-                            Padding(
-                              padding: EdgeInsets.symmetric(horizontal: 12),
-                              child: Text('Line'),
+                        Expanded(
+                          child: TextField(
+                            controller: _stepPxController,
+                            decoration: const InputDecoration(
+                              isDense: true,
+                              labelText: 'Point gap (px)',
+                              helperText: 'Smaller = more points',
                             ),
-                            Padding(
-                              padding: EdgeInsets.symmetric(horizontal: 12),
-                              child: Text('Pen'),
-                            ),
-                            Padding(
-                              padding: EdgeInsets.symmetric(horizontal: 12),
-                              child: Text('Circle'),
-                            ),
-                            Padding(
-                              padding: EdgeInsets.symmetric(horizontal: 12),
-                              child: Text('Rect'),
-                            ),
-                          ],
+                            keyboardType:
+                                const TextInputType.numberWithOptions(decimal: true),
+                          ),
                         ),
-                        FilterChip(
-                          label: const Text('Continue'),
-                          selected: _appendPen,
-                          onSelected: (value) {
-                            setState(() {
-                              _appendPen = value;
-                            });
-                          },
-                        ),
-                        FilterChip(
-                          label: const Text('Select'),
-                          selected: _selectMode,
-                          onSelected: (value) {
-                            setState(() {
-                              _selectMode = value;
-                              _isSelecting = false;
-                              _selectStart = null;
-                              _selectRect = null;
-                            });
-                          },
+                        const SizedBox(width: 8),
+                        ElevatedButton(
+                          onPressed: _applyStepPx,
+                          child: const Text('Apply'),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 8),
                     Text('Smooth', style: titleStyle),
                     Slider(
                       min: 1,
@@ -1264,8 +1435,12 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                           selected: false,
                           onSelected: (_) => _setPresetSize(353.0, 250.0),
                         ),
-                        SizedBox(
-                          width: 110,
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
                           child: TextField(
                             controller: _bgWidthController,
                             decoration: const InputDecoration(
@@ -1276,8 +1451,8 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                                 const TextInputType.numberWithOptions(decimal: true),
                           ),
                         ),
-                        SizedBox(
-                          width: 110,
+                        const SizedBox(width: 8),
+                        Expanded(
                           child: TextField(
                             controller: _bgHeightController,
                             decoration: const InputDecoration(
@@ -1288,6 +1463,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                                 const TextInputType.numberWithOptions(decimal: true),
                           ),
                         ),
+                        const SizedBox(width: 8),
                         ElevatedButton(
                           onPressed: _applyBackgroundSize,
                           child: const Text('Apply Size'),
@@ -1328,7 +1504,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                               labelText: 'mm_per_px',
                             ),
                             keyboardType:
-                                const TextInputType.numberWithOptions(decimal: true),
+                            const TextInputType.numberWithOptions(decimal: true),
                           ),
                         ),
                         ElevatedButton(
@@ -1391,27 +1567,25 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 // ===== Point Table Rows (X,Y,Z 편집 가능) =====
   List<DataRow> _buildPointRows() {
     // 포인트 테이블 UI용 행 생성 (X,Y는 표시, Z는 편집 가능).
-    final source = _pointsForTable();
-    final zValues = _zValuesForTable(source.length);
+    final rows = _tableRows();
 
-    if (source.isEmpty) return const <DataRow>[];
+    if (rows.isEmpty) return const <DataRow>[];
 
-    return List<DataRow>.generate(source.length, (index) {
-      final p = source[index];
-      final z = zValues[index];
+    return List<DataRow>.generate(rows.length, (index) {
+      final row = rows[index];
 
       return DataRow(
         cells: [
-          DataCell(Text('S$index')),
-          DataCell(Text(p.dx.toStringAsFixed(2))),
-          DataCell(Text(p.dy.toStringAsFixed(2))),
+          DataCell(Text(row.label)),
+          DataCell(Text(row.point.dx.toStringAsFixed(2))),
+          DataCell(Text(row.point.dy.toStringAsFixed(2))),
           DataCell(
             SizedBox(
               width: 70,
               child: TextFormField(
                 key: ValueKey<String>(
-                    'z-${_selectedStrokeIndex ?? -1}-$index'),
-                initialValue: z.toStringAsFixed(2),
+                    'z-${row.label}-${row.z.toStringAsFixed(2)}'),
+                initialValue: row.z.toStringAsFixed(2),
                 keyboardType: const TextInputType.numberWithOptions(
                   signed: true,
                   decimal: true,
@@ -1419,13 +1593,24 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                 decoration: const InputDecoration(
                   isDense: true,
                   contentPadding:
-                      EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                  EdgeInsets.symmetric(horizontal: 6, vertical: 8),
                 ),
                 onChanged: (value) {
                   final parsed = double.tryParse(value.trim());
                   if (parsed == null) return;
                   setState(() {
-                    zValues[index] = parsed;
+                    if (row.strokeIndex != null) {
+                      final stroke = _strokes[row.strokeIndex!];
+                      stroke.zValues = _syncZList(
+                        stroke.zValues,
+                        stroke.samples.length,
+                      );
+                      stroke.zValues[row.pointIndex] = parsed;
+                    } else {
+                      _currentZValues =
+                          _syncZList(_currentZValues, _pointsMm.length);
+                      _currentZValues[row.pointIndex] = parsed;
+                    }
                   });
                 },
               ),
@@ -1467,6 +1652,65 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return _currentZValues;
   }
 
+  List<_TablePointRow> _tableRows() {
+    if (_selectedStrokeIndex != null &&
+        _selectedStrokeIndex! >= 0 &&
+        _selectedStrokeIndex! < _strokes.length) {
+      final stroke = _strokes[_selectedStrokeIndex!];
+      final imagePoints = stroke.samples
+          .map(_canvasToImageClamped)
+          .toList(growable: false);
+      final points = _applyTransform(imagePoints, _mmPerPx);
+      stroke.zValues = _syncZList(stroke.zValues, points.length);
+      return List<_TablePointRow>.generate(points.length, (index) {
+        return _TablePointRow(
+          label: 'S${_selectedStrokeIndex!}-$index',
+          point: points[index],
+          z: stroke.zValues[index],
+          pointIndex: index,
+          strokeIndex: _selectedStrokeIndex,
+        );
+      });
+    }
+
+    if (_strokes.isNotEmpty) {
+      final rows = <_TablePointRow>[];
+      for (var strokeIndex = 0; strokeIndex < _strokes.length; strokeIndex++) {
+        final stroke = _strokes[strokeIndex];
+        final imagePoints = stroke.samples
+            .map(_canvasToImageClamped)
+            .toList(growable: false);
+        final points = _applyTransform(imagePoints, _mmPerPx);
+        stroke.zValues = _syncZList(stroke.zValues, points.length);
+        for (var pointIndex = 0; pointIndex < points.length; pointIndex++) {
+          rows.add(
+            _TablePointRow(
+              label: 'S$strokeIndex-$pointIndex',
+              point: points[pointIndex],
+              z: stroke.zValues[pointIndex],
+              pointIndex: pointIndex,
+              strokeIndex: strokeIndex,
+            ),
+          );
+        }
+      }
+      return rows;
+    }
+
+    final points = _pointsMm.isNotEmpty
+        ? _pointsMm
+        : (_pointsImage.isNotEmpty ? _pointsImage : _pointsPx);
+    _currentZValues = _syncZList(_currentZValues, points.length);
+    return List<_TablePointRow>.generate(points.length, (index) {
+      return _TablePointRow(
+        label: 'C$index',
+        point: points[index],
+        z: _currentZValues[index],
+        pointIndex: index,
+      );
+    });
+  }
+
   double _polylineLength(List<Offset> points) {
     if (points.length < 2) return 0.0;
     var sum = 0.0;
@@ -1501,7 +1745,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
         return _polylineLength(_pointsImage);
       }
       final rawImage =
-          _rawPoints.map(_canvasToImageClamped).toList(growable: false);
+      _rawPoints.map(_canvasToImageClamped).toList(growable: false);
       return _polylineLength(rawImage);
     }
     return 0.0;
@@ -1531,9 +1775,9 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       final localX = (p.dx - rect.left).clamp(0.0, rect.width);
       final localY = (p.dy - rect.top).clamp(0.0, rect.height);
       final x =
-          rect.width == 0 ? 0.0 : localX / rect.width * logicalSize.width;
+      rect.width == 0 ? 0.0 : localX / rect.width * logicalSize.width;
       final y =
-          rect.height == 0 ? 0.0 : localY / rect.height * logicalSize.height;
+      rect.height == 0 ? 0.0 : localY / rect.height * logicalSize.height;
       return Offset(x.toDouble(), y.toDouble());
     }
     final sx = _imageSize!.width / rect.width;
@@ -1554,7 +1798,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     if (_userFrameMmSize != null || _imageSize == null) {
       final logicalSize = _userFramePxSize ?? Size(rect.width, rect.height);
       final x =
-          logicalSize.width == 0 ? 0.0 : p.dx / logicalSize.width * rect.width;
+      logicalSize.width == 0 ? 0.0 : p.dx / logicalSize.width * rect.width;
       final y = logicalSize.height == 0
           ? 0.0
           : p.dy / logicalSize.height * rect.height;
@@ -1857,7 +2101,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     // ??? ?? ?? ???.
     if (points.length < 3) return points;
     final window =
-        _smoothingWindow.isOdd ? _smoothingWindow : _smoothingWindow + 1;
+    _smoothingWindow.isOdd ? _smoothingWindow : _smoothingWindow + 1;
     final half = window ~/ 2;
     final original = List<Offset>.from(points);
     final result = List<Offset>.from(points);
@@ -1932,11 +2176,11 @@ class LinePainter extends CustomPainter {
       final isSelected = selectedStrokeIndex == i;
       final paint = isSelected
           ? (Paint()
-            ..color = Colors.orange
-            ..strokeWidth = 3
-            ..style = PaintingStyle.stroke
-            ..strokeCap = StrokeCap.round
-            ..strokeJoin = StrokeJoin.round)
+        ..color = Colors.orange
+        ..strokeWidth = 3
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round)
           : linePaint;
 
       _drawStrokeIndex(canvas, size, stroke, i, strokeLabelStyle);
@@ -1953,7 +2197,7 @@ class LinePainter extends CustomPainter {
       final stroke = strokes[i];
       final isSelected = selectedStrokeIndex == i;
       final pPaint =
-          isSelected ? (Paint()..color = Colors.orangeAccent) : pointPaint;
+      isSelected ? (Paint()..color = Colors.orangeAccent) : pointPaint;
       for (final p in stroke.samples) {
         canvas.drawCircle(p, 3, pPaint);
       }
@@ -2024,12 +2268,12 @@ class LinePainter extends CustomPainter {
   }
 
   void _drawStrokeIndex(
-    Canvas canvas,
-    Size size,
-    Stroke stroke,
-    int index,
-    TextStyle style,
-  ) {
+      Canvas canvas,
+      Size size,
+      Stroke stroke,
+      int index,
+      TextStyle style,
+      ) {
     if (stroke.path.isEmpty) return;
     final first = stroke.path.first;
     final textPainter = TextPainter(
@@ -2070,6 +2314,22 @@ class _PointHit {
   final int strokeIndex;
   final int sampleIndex;
   final int? pathIndex;
+}
+
+class _TablePointRow {
+  _TablePointRow({
+    required this.label,
+    required this.point,
+    required this.z,
+    required this.pointIndex,
+    this.strokeIndex,
+  });
+
+  final String label;
+  final Offset point;
+  final double z;
+  final int pointIndex;
+  final int? strokeIndex;
 }
 
 class WebViewerPage extends StatefulWidget {

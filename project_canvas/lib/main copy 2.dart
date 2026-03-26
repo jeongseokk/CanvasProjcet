@@ -39,73 +39,108 @@ class CanvasHomePage extends StatefulWidget {
 }
 
 class _CanvasHomePageState extends State<CanvasHomePage> {
+  // ===== 기본 설정값 =====
+  // 샘플 간격(px), mm/px 비율, 소켓 기본 연결 정보.
   static const double _defaultStepPx = 10.0;
   static const double _defaultMmPerPx = 1.0;
   static const String _defaultHost = '127.0.0.1';
   static const int _defaultPort = 9000;
 
+  // ===== 그리기 입력 상태 =====
+  // 포인터 시작/끝점, 펜 원본 점들, 현재 그리는 중인지 여부.
   Offset? _p0;
   Offset? _p1;
   List<Offset> _rawPoints = <Offset>[];
   bool _isDrawing = false;
 
+  // ===== 변환/샘플링 설정 =====
+  // stepPx: 샘플 간격(px), mmPerPx: px -> mm 변환 비율.
   double _stepPx = _defaultStepPx;
   double _mmPerPx = _defaultMmPerPx;
 
+  // ===== 현재 포인트 캐시 =====
+  // _pointsPx: 캔버스 좌표, _pointsImage: 이미지 좌표, _pointsMm: 실측(mm) 좌표.
   List<Offset> _pointsPx = <Offset>[];
   List<Offset> _pointsMm = <Offset>[];
   List<Offset> _deltasMm = <Offset>[];
   List<Offset> _pointsImage = <Offset>[];
 
   // ===== Z (Current) =====
+  // ===== Z (현재 선/도형용) =====
+  // _pointsMm와 길이를 동기화하여 인덱스로 바로 접근 가능하게 한다.
   List<double> _currentZValues = <double>[]; // _pointsMm와 길이 동기화
 
+  // ===== 스트로크(여러 선) 관리 =====
+  // pen/line 등으로 완성된 선들을 모아두는 리스트.
   final List<Stroke> _strokes = <Stroke>[];
   int? _dragStrokeIndex;
   Offset? _dragLast;
   bool _isMoving = false;
 
+  // ===== 선택/이어그리기 상태 =====
   int? _selectedStrokeIndex;
 
   bool _appendPen = false;
   int? _appendStrokeIndex;
 
+  // ===== 드래그 박스 선택 =====
   bool _selectMode = false;
   bool _isSelecting = false;
   Offset? _selectStart;
   Rect? _selectRect;
 
+  // ===== 스무딩(이동 평균) =====
   int _smoothingWindow = 5;
   int? _smoothingBaseStrokeIndex;
 
+  // ===== 점 편집(Shift+드래그) =====
   bool _isEditingPoint = false;
   int? _editStrokeIndex;
   int? _editSampleIndex;
   int? _editPathIndex;
 
+  // ===== 현재 그리기 모드 =====
   DrawMode _mode = DrawMode.line;
 
+  // ===== 배경 이미지/프레임 =====
   File? _imageFile;
   Size? _imageSize;
   Size? _userFrameMmSize;
   Size? _userFramePxSize;
+  double _userFrameScale = 2.3;
+  bool _useUserFrameOverride = true;
   Rect? _frameRect;
   final ImagePicker _imagePicker = ImagePicker();
 
+  // ===== UI 입력 컨트롤러 =====
   final TextEditingController _hostController =
-      TextEditingController(text: _defaultHost);
+  TextEditingController(text: _defaultHost);
   final TextEditingController _portController =
-      TextEditingController(text: _defaultPort.toString());
+  TextEditingController(text: _defaultPort.toString());
   final TextEditingController _zController = TextEditingController(text: '0.0');
   final TextEditingController _mmPerPxController =
-      TextEditingController(text: _defaultMmPerPx.toStringAsFixed(3));
+  TextEditingController(text: _defaultMmPerPx.toStringAsFixed(3));
   final TextEditingController _bgWidthController = TextEditingController();
   final TextEditingController _bgHeightController = TextEditingController();
 
+  // ===== 소켓 상태 =====
   Socket? _socket;
   String? _connectedHost;
   int? _connectedPort;
   String _status = 'Ready';
+
+  @override
+  void initState() {
+    super.initState();
+    // 기본 프레임을 A2로 잡아서 박스가 너무 작아 보이지 않게 함.
+    // 현재 스케일 기준으로 mm_per_px를 초기화해 길이 표시가 안정적이도록 함.
+    _bgWidthController.text = '594.0';
+    _bgHeightController.text = '420.0';
+    _userFrameMmSize = const Size(594.0, 420.0);
+    _userFramePxSize = const Size(594.0, 420.0);
+    _mmPerPx = 1.0;
+    _mmPerPxController.text = _mmPerPx.toStringAsFixed(3);
+  }
 
   @override
   void dispose() {
@@ -120,6 +155,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _applyMmPerPx() {
+    // 사용자가 mm/px 값을 직접 입력해서 적용.
     final value = double.tryParse(_mmPerPxController.text.trim());
     if (value == null || value <= 0) {
       setState(() {
@@ -134,6 +170,8 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _applyBackgroundSize() {
+    // 사용자가 입력한 실제 크기(mm)로 프레임 기준을 설정한다.
+    // 프레임 확대/축소는 별도의 Frame Scale로 제어.
     if (_frameRect == null) {
       setState(() {
         _status = 'Background size: no frame yet';
@@ -149,32 +187,25 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       });
       return;
     }
-    final frame = _frameRect!;
-    double? mmPerPx;
-    if (widthMm != null && widthMm > 0) {
-      mmPerPx = widthMm / frame.width;
-    }
-    if (heightMm != null && heightMm > 0) {
-      final heightMmPerPx = heightMm / frame.height;
-      mmPerPx =
-          mmPerPx == null ? heightMmPerPx : math.min(mmPerPx, heightMmPerPx);
-    }
-    if (mmPerPx == null) return;
     setState(() {
       if (widthMm != null &&
           widthMm > 0 &&
           heightMm != null &&
           heightMm > 0) {
+        // mm 크기를 그대로 px 기준으로 저장(1:1), 확대/축소는 스케일로 처리.
         _userFrameMmSize = Size(widthMm, heightMm);
         _userFramePxSize = Size(widthMm, heightMm);
       }
+      // 스케일 변경 시에도 mm 길이가 안정적으로 보이도록 보정.
       _mmPerPx = 1.0;
       _mmPerPxController.text = _mmPerPx.toStringAsFixed(3);
+      _useUserFrameOverride = true;
       _status = 'Background size applied';
     });
   }
 
   void _setPresetSize(double widthMm, double heightMm) {
+    // 표준 용지 프리셋(A/B 시리즈).
     setState(() {
       _bgWidthController.text = widthMm.toStringAsFixed(1);
       _bgHeightController.text = heightMm.toStringAsFixed(1);
@@ -182,6 +213,8 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     _applyBackgroundSize();
   }
 
+  // ===== 포인터 입력 처리 =====
+  // 좌클릭: 그리기, 우클릭: 스트로크 이동, Shift+클릭: 샘플 점 편집.
   void _onPointerDown(PointerDownEvent event) {
     if (event.buttons & kSecondaryMouseButton != 0) {
       _beginMove(event.localPosition);
@@ -210,7 +243,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
         if (_appendPen && _strokes.isNotEmpty) {
           _appendStrokeIndex = _strokes.length - 1;
           final last =
-              _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
+          _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
           _p0 = last ?? startPos;
           _p1 = startPos;
         } else {
@@ -222,7 +255,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
         if (_mode == DrawMode.pen && _appendPen && _strokes.isNotEmpty) {
           _appendStrokeIndex = _strokes.length - 1;
           final last =
-              _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
+          _strokes.last.path.isNotEmpty ? _strokes.last.path.last : null;
           if (last != null) {
             _rawPoints = <Offset>[last, _clampToFrame(event.localPosition)];
             _p0 = last;
@@ -245,6 +278,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _onPointerMove(PointerMoveEvent event) {
+    // 이동/선택/그리기 상태에 따라 분기 처리.
     if (_isMoving) {
       _updateMove(event.localPosition);
       return;
@@ -273,6 +307,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _onPointerUp(PointerUpEvent event) {
+    // 그리기 종료 시 스트로크 확정 및 Z 리스트 동기화.
     if (_isMoving) {
       _endMove();
       return;
@@ -348,6 +383,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _reset() {
+    // 전체 상태 초기화(그림/선택/이미지/좌표 모두 리셋).
     setState(() {
       _p0 = null;
       _p1 = null;
@@ -405,6 +441,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   Future<void> _pickImage() async {
+    // 갤러리에서 이미지 선택 후 배경으로 로드.
     final picked = await _imagePicker.pickImage(source: ImageSource.gallery);
     if (picked == null) return;
     final bytes = await picked.readAsBytes();
@@ -421,6 +458,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   Future<void> _ensureConnected() async {
+    // 소켓 연결(호스트/포트 변경 시 재연결).
     final host = _hostController.text.trim();
     final port = int.tryParse(_portController.text.trim());
     if (host.isEmpty || port == null) {
@@ -446,7 +484,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       setState(() {});
       final socket = await Socket.connect(host, port);
       socket.listen(
-        (data) {
+            (data) {
           final text = utf8.decode(data).trim();
           if (text.isNotEmpty) {
             setState(() {
@@ -482,10 +520,11 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
   Future<void> _sendJson() async {
+    // 현재 그려진 포인트(또는 스트로크)를 JSON으로 직렬화해서 소켓 전송.
     if (_strokes.isEmpty) {
       if ((_mode == DrawMode.line ||
-              _mode == DrawMode.circle ||
-              _mode == DrawMode.rect) &&
+          _mode == DrawMode.circle ||
+          _mode == DrawMode.rect) &&
           (_p0 == null || _p1 == null)) {
         setState(() {
           _status = 'No line to send';
@@ -519,6 +558,8 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   // ✅ payload는 "표에 선택된 대상(Current 또는 Stroke)" 기준으로 보냄
   //    points: [[x,y,z], ...]
   Map<String, dynamic> _buildPayload() {
+    // Stroke가 있으면 각 스트로크를 이어서 보내고,
+    // 스트로크 끝에 ["000"] 마커를 추가한다.
     final allPoints = <List<dynamic>>[];
 
     if (_strokes.isEmpty) {
@@ -537,7 +578,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
     for (final stroke in _strokes) {
       final imagePoints =
-          stroke.samples.map(_canvasToImageClamped).toList(growable: false);
+      stroke.samples.map(_canvasToImageClamped).toList(growable: false);
       final pointsMm = _applyTransform(imagePoints, _mmPerPx);
       stroke.zValues = _syncZList(stroke.zValues, pointsMm.length);
       for (var i = 0; i < pointsMm.length; i++) {
@@ -549,7 +590,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
           double.parse(z.toStringAsFixed(2)),
         ]);
       }
-      // Stroke end marker: "00"
+      // 스트로크 끝 마커: "000"
       allPoints.add(<dynamic>["000"]);
     }
 
@@ -557,11 +598,12 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   int _payloadPointCount() {
+    // 전송될 포인트 개수 계산(스트로크 끝 마커 포함).
     if (_strokes.isEmpty) return _pointsMm.length;
     var count = 0;
     for (final stroke in _strokes) {
       count += stroke.samples.length;
-      count += 1; // end marker ["00"]
+      count += 1; // 스트로크 끝 마커 ["000"]
     }
     return count;
   }
@@ -576,6 +618,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
   // Z 리스트 길이 동기화(부족하면 0 채움)
   List<double> _syncZList(List<double> source, int length) {
+    // Z 리스트 길이 동기화(부족하면 0.0으로 채움).
     final list = List<double>.from(source);
     if (list.length < length) {
       list.addAll(List<double>.filled(length - list.length, 0.0));
@@ -587,9 +630,11 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
   void _rebuildPoints() {
+    // 현재 모드에 맞는 포인트를 다시 생성하고
+    // 이미지 좌표 -> 캔버스 좌표 -> mm 좌표까지 동기화한다.
     if ((_mode == DrawMode.line ||
-            _mode == DrawMode.circle ||
-            _mode == DrawMode.rect) &&
+        _mode == DrawMode.circle ||
+        _mode == DrawMode.rect) &&
         (_p0 == null || _p1 == null)) {
       _pointsPx = <Offset>[];
       _pointsImage = <Offset>[];
@@ -632,7 +677,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       points = _imagePointsToCanvas(pointsImage);
     } else {
       final rawImage =
-          _rawPoints.map(_canvasToImageClamped).toList(growable: false);
+      _rawPoints.map(_canvasToImageClamped).toList(growable: false);
       pointsImage = _resamplePolyline(rawImage, _stepPx);
       points = _imagePointsToCanvas(pointsImage);
     }
@@ -661,6 +706,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   List<Offset> _applyTransform(List<Offset> points, double scale) {
+    // mm 스케일 적용 + (필요 시) Y 플립/회전.
     const bool yFlip = false;
     const double rotationDeg = 0.0;
 
@@ -685,6 +731,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   List<Offset> _buildDeltas(List<Offset> points) {
+    // 인접 포인트 간 델타 벡터 계산.
     final deltas = <Offset>[];
     for (var i = 0; i + 1 < points.length; i++) {
       final a = points[i];
@@ -695,6 +742,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   List<Offset> _resamplePolyline(List<Offset> input, double stepPx) {
+    // 선분 길이를 일정 간격(stepPx)으로 재샘플링.
     if (input.isEmpty) return <Offset>[];
     if (input.length == 1 || stepPx <= 0) return <Offset>[input.first];
 
@@ -727,6 +775,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   List<Offset> _circlePoints(Offset center, Offset edge, double stepPx) {
+    // 원의 둘레를 일정 간격으로 샘플링.
     final radius = (edge - center).distance;
     if (radius == 0) return <Offset>[center];
     final circumference = 2 * math.pi * radius;
@@ -745,6 +794,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   List<Offset> _rectPoints(Offset a, Offset b, double stepPx) {
+    // 사각형 외곽선을 일정 간격으로 샘플링.
     final left = math.min(a.dx, b.dx);
     final right = math.max(a.dx, b.dx);
     final top = math.min(a.dy, b.dy);
@@ -800,6 +850,9 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   @override
   Widget build(BuildContext context) {
     final lengthPx = _lengthForMode();
+    final mediaQuery = MediaQuery.of(context);
+    final isLandscape =
+        mediaQuery.orientation == Orientation.landscape;
     final strokeItems = <DropdownMenuItem<int?>>[
       const DropdownMenuItem<int?>(
         value: null,
@@ -807,7 +860,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       ),
       ...List<DropdownMenuItem<int?>>.generate(
         _strokes.length,
-        (index) => DropdownMenuItem<int?>(
+            (index) => DropdownMenuItem<int?>(
           value: index,
           child: Text('S$index'),
         ),
@@ -815,374 +868,484 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     ];
 
     return Scaffold(
+      resizeToAvoidBottomInset: true,
       appBar: AppBar(
         title: const Text('Canvas Line Sender'),
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: Container(
-              color: Colors.white,
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final maxWidth = constraints.maxWidth * 0.9;
-                  final maxHeight = constraints.maxHeight * 0.9;
-                  final frameSize = _imageSize != null
-                      ? _fitFrameSize(_imageSize!, maxWidth, maxHeight)
-                      : (_userFramePxSize != null
-                          ? Size(
-                              math.min(_userFramePxSize!.width, maxWidth),
-                              math.min(_userFramePxSize!.height, maxHeight),
-                            )
-                          : Size(maxWidth, maxHeight));
-                  final frameLeft =
-                      (constraints.maxWidth - frameSize.width) / 2;
-                  final frameTop =
-                      (constraints.maxHeight - frameSize.height) / 2;
-                  _frameRect = Rect.fromLTWH(
-                    frameLeft,
-                    frameTop,
-                    frameSize.width,
-                    frameSize.height,
-                  );
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final canvas = _buildCanvasArea();
+          final controls = _buildControlsPanel(
+            context,
+            strokeItems,
+            lengthPx,
+            isLandscape: isLandscape,
+          );
 
-                  return Stack(
-                    children: [
-                      Center(
-                        child: Container(
-                          width: frameSize.width,
-                          height: frameSize.height,
-                          decoration: BoxDecoration(
-                            color: Colors.grey.shade50,
-                            border: Border.all(
-                              color: Colors.grey.shade400,
-                              width: 2,
-                            ),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.06),
-                                blurRadius: 6,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
-                          ),
-                          child: _imageFile == null
-                              ? const Center(child: Text('No Image'))
-                              : ClipRect(
-                                  child: Image.file(
-                                    _imageFile!,
-                                    fit: BoxFit.contain,
-                                  ),
-                                ),
-                        ),
-                      ),
-                      Listener(
-                        onPointerDown: _onPointerDown,
-                        onPointerMove: _onPointerMove,
-                        onPointerUp: _onPointerUp,
-                        child: CustomPaint(
-                          painter: LinePainter(
-                            p0: _p0,
-                            p1: _p1,
-                            points: _pointsPx,
-                            rawPoints: _rawPoints,
-                            mode: _mode,
-                            strokes: _strokes,
-                            selectRect: _selectRect,
-                            selectedStrokeIndex: _selectedStrokeIndex,
-                            frameRect: _frameRect,
-                          ),
-                          size: Size.infinite,
-                        ),
-                      ),
-                    ],
-                  );
-                },
-              ),
-            ),
-          ),
-
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.grey.shade200,
-              border: Border(top: BorderSide(color: Colors.grey.shade400)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+          if (isLandscape) {
+            final panelWidth = math
+                .min(420.0, constraints.maxWidth * 0.38)
+                .clamp(300.0, 520.0)
+                .toDouble();
+            return Row(
               children: [
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(
-                      width: 240,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('Start: ${_formatPointImage(_p0)}'),
-                          Text('End: ${_formatPointImage(_p1)}'),
-                          Text('Length(img px): ${lengthPx.toStringAsFixed(2)}'),
-                          Text('Points: ${_pointsPx.length}'),
-                          Text('Status: $_status'),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 16),
-
-                    Expanded(
-                      child: Align(
-                        alignment: Alignment.topCenter,
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 560),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Text(
-                                    'Points Table',
-                                    style: Theme.of(context).textTheme.titleMedium,
-                                  ),
-                                  const SizedBox(width: 12),
-                                  DropdownButton<int?>(
-                                    value: _selectedStrokeIndex,
-                                    items: strokeItems,
-                                    onChanged: (value) {
-                                      setState(() {
-                                        _selectedStrokeIndex = value;
-                                      });
-                                    },
-                                    isDense: true,
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 6),
-                              SizedBox(
-                                height: 170,
-                                child: DecoratedBox(
-                                  decoration: BoxDecoration(
-                                    color: Colors.white,
-                                    border: Border.all(color: Colors.grey.shade400),
-                                  ),
-                                  child: Scrollbar(
-                                    child: SingleChildScrollView(
-                                      child: DataTable(
-                                        headingRowHeight: 32,
-                                        dataRowHeight: 30,
-                                        columns: const [
-                                          DataColumn(label: Text('S')),
-                                          DataColumn(label: Text('X')),
-                                          DataColumn(label: Text('Y')),
-                                          DataColumn(label: Text('Z')),
-                                        ],
-                                        rows: _buildPointRows(),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-
-                    const SizedBox(width: 16),
-
-                    SizedBox(
-                      width: 240,
-                      child: Column(
-                        children: [
-                          TextField(
-                            controller: _hostController,
-                            decoration: const InputDecoration(
-                              labelText: 'Host',
-                              isDense: true,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          TextField(
-                            controller: _portController,
-                            keyboardType: TextInputType.number,
-                            decoration: const InputDecoration(
-                              labelText: 'Port',
-                              isDense: true,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          TextField(
-                            controller: _zController,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              signed: true,
-                              decimal: true,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'Z (mm)',
-                              isDense: true,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-
-                const SizedBox(height: 10),
-
-                Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: [
-                    ElevatedButton(onPressed: _reset, child: const Text('Reset')),
-                    ElevatedButton(onPressed: _sendJson, child: const Text('Send')),
-                    ElevatedButton(onPressed: _deleteSelectedOrLast, child: const Text('Delete')),
-                    ElevatedButton(onPressed: _pickImage, child: const Text('Upload')),
-                    ElevatedButton(onPressed: _openStepViewer, child: const Text('STEP Viewer')),
-                    ElevatedButton(onPressed: _openOnshapeViewer, child: const Text('Onshape')),
-
-                    const SizedBox(width: 6),
-                    ToggleButtons(
-                      isSelected: [
-                        _mode == DrawMode.line,
-                        _mode == DrawMode.pen,
-                        _mode == DrawMode.circle,
-                        _mode == DrawMode.rect,
-                      ],
-                      onPressed: (index) {
-                        setState(() {
-                          _mode = DrawMode.values[index];
-                          _clearCurrentDrawing();
-                        });
-                      },
-                      children: const [
-                        Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 12),
-                            child: Text('Line')),
-                        Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 12),
-                            child: Text('Pen')),
-                        Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 12),
-                            child: Text('Circle')),
-                        Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 12),
-                            child: Text('Rect')),
-                      ],
-                    ),
-                    FilterChip(
-                      label: const Text('Continue'),
-                      selected: _appendPen,
-                      onSelected: (value) {
-                        setState(() {
-                          _appendPen = value;
-                        });
-                      },
-                    ),
-                    FilterChip(
-                      label: const Text('Select'),
-                      selected: _selectMode,
-                      onSelected: (value) {
-                        setState(() {
-                          _selectMode = value;
-                          _isSelecting = false;
-                          _selectStart = null;
-                          _selectRect = null;
-                        });
-                      },
-                    ),
-                    const Text('Smooth'),
-                    SizedBox(
-                      width: 160,
-                      child: Slider(
-                        min: 1,
-                        max: 21,
-                        divisions: 10,
-                        label: _smoothingWindow.toString(),
-                        value: _smoothingWindow.toDouble(),
-                        onChanged: (value) {
-                          setState(() {
-                            var v = value.round();
-                            if (v.isEven) v += 1;
-                            _smoothingWindow = v.clamp(1, 21);
-                          });
-                          _applySmoothingToSelected();
-                        },
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    const Text('BG Size (mm)'),
-                    FilterChip(
-                      label: const Text('A4'),
-                      selected: false,
-                      onSelected: (_) => _setPresetSize(297.0, 210.0),
-                    ),
-                    FilterChip(
-                      label: const Text('A2'),
-                      selected: false,
-                      onSelected: (_) => _setPresetSize(594.0, 420.0),
-                    ),
-                    FilterChip(
-                      label: const Text('B4'),
-                      selected: false,
-                      onSelected: (_) => _setPresetSize(353.0, 250.0),
-                    ),
-                    SizedBox(
-                      width: 110,
-                      child: TextField(
-                        controller: _bgWidthController,
-                        decoration: const InputDecoration(
-                          labelText: 'W',
-                          isDense: true,
-                        ),
-                        keyboardType:
-                            const TextInputType.numberWithOptions(decimal: true),
-                      ),
-                    ),
-                    SizedBox(
-                      width: 110,
-                      child: TextField(
-                        controller: _bgHeightController,
-                        decoration: const InputDecoration(
-                          labelText: 'H',
-                          isDense: true,
-                        ),
-                        keyboardType:
-                            const TextInputType.numberWithOptions(decimal: true),
-                      ),
-                    ),
-                    ElevatedButton(
-                      onPressed: _applyBackgroundSize,
-                      child: const Text('Apply Size'),
-                    ),
-                    const Text('mm/px'),
-                    SizedBox(
-                      width: 110,
-                      child: TextField(
-                        controller: _mmPerPxController,
-                        decoration: const InputDecoration(
-                          isDense: true,
-                          labelText: 'mm_per_px',
-                        ),
-                        keyboardType:
-                            const TextInputType.numberWithOptions(decimal: true),
-                      ),
-                    ),
-                    ElevatedButton(
-                      onPressed: _applyMmPerPx,
-                      child: const Text('Apply mm/px'),
-                    ),
-                  ],
-                ),
+                Expanded(child: canvas),
+                SizedBox(width: panelWidth, child: controls),
               ],
-            ),
-          ),
-        ],
+            );
+          }
+
+          final panelHeight = math.min(360.0, constraints.maxHeight * 0.45);
+          return Column(
+            children: [
+              Expanded(child: canvas),
+              SizedBox(height: panelHeight, child: controls),
+            ],
+          );
+        },
       ),
     );
   }
 
+  Widget _buildCanvasArea() {
+    return Container(
+      color: Colors.white,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final maxWidth = constraints.maxWidth * 0.9;
+          final maxHeight = constraints.maxHeight * 0.9;
+          final frameSize = _useUserFrameOverride && _userFramePxSize != null
+              ? (() {
+            final scaledWidth = _userFramePxSize!.width * _userFrameScale;
+            final scaledHeight =
+                _userFramePxSize!.height * _userFrameScale;
+            final scale = math.min(
+              math.min(maxWidth / scaledWidth, maxHeight / scaledHeight),
+              1.0,
+            );
+            return Size(
+              scaledWidth * scale,
+              scaledHeight * scale,
+            );
+          })()
+              : (_imageSize != null
+              ? _fitFrameSize(_imageSize!, maxWidth, maxHeight)
+              : Size(maxWidth, maxHeight));
+          final frameLeft = (constraints.maxWidth - frameSize.width) / 2;
+          final frameTop = (constraints.maxHeight - frameSize.height) / 2;
+          _frameRect = Rect.fromLTWH(
+            frameLeft,
+            frameTop,
+            frameSize.width,
+            frameSize.height,
+          );
+
+          return Stack(
+            children: [
+              Center(
+                child: Container(
+                  width: frameSize.width,
+                  height: frameSize.height,
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade50,
+                    border: Border.all(
+                      color: Colors.grey.shade400,
+                      width: 2,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.06),
+                        blurRadius: 6,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: _imageFile == null
+                      ? const Center(child: Text('No Image'))
+                      : ClipRect(
+                    child: Image.file(
+                      _imageFile!,
+                      fit: BoxFit.contain,
+                    ),
+                  ),
+                ),
+              ),
+              Listener(
+                onPointerDown: _onPointerDown,
+                onPointerMove: _onPointerMove,
+                onPointerUp: _onPointerUp,
+                child: CustomPaint(
+                  painter: LinePainter(
+                    p0: _p0,
+                    p1: _p1,
+                    points: _pointsPx,
+                    rawPoints: _rawPoints,
+                    mode: _mode,
+                    strokes: _strokes,
+                    selectRect: _selectRect,
+                    selectedStrokeIndex: _selectedStrokeIndex,
+                    frameRect: _frameRect,
+                  ),
+                  size: Size.infinite,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildControlsPanel(
+      BuildContext context,
+      List<DropdownMenuItem<int?>> strokeItems,
+      double lengthPx, {
+        required bool isLandscape,
+      }) {
+    final safeBottom = MediaQuery.of(context).padding.bottom;
+    final titleStyle = Theme.of(context).textTheme.titleMedium;
+    final panelDecoration = BoxDecoration(
+      color: Colors.grey.shade200,
+      border: Border(
+        top: BorderSide(color: Colors.grey.shade400),
+        left: BorderSide(color: Colors.grey.shade400),
+      ),
+    );
+
+    Widget section(Widget child) {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          border: Border.all(color: Colors.grey.shade400),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: child,
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + safeBottom),
+      decoration: panelDecoration,
+      child: SingleChildScrollView(
+        child: Container(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              section(
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Start: ${_formatPointImage(_p0)}'),
+                    Text('End: ${_formatPointImage(_p1)}'),
+                    Text('Length(img px): ${lengthPx.toStringAsFixed(2)}'),
+                    Text('Points: ${_pointsPx.length}'),
+                    Text('Status: $_status'),
+                  ],
+                ),
+              ),
+              section(
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text('Points Table', style: titleStyle),
+                        const SizedBox(width: 12),
+                        DropdownButton<int?>(
+                          value: _selectedStrokeIndex,
+                          items: strokeItems,
+                          onChanged: (value) {
+                            setState(() {
+                              _selectedStrokeIndex = value;
+                            });
+                          },
+                          isDense: true,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    SizedBox(
+                      height: isLandscape ? 220 : 170,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          border: Border.all(color: Colors.grey.shade400),
+                        ),
+                        child: Scrollbar(
+                          child: SingleChildScrollView(
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: DataTable(
+                                headingRowHeight: 32,
+                                dataRowHeight: 30,
+                                columns: const [
+                                  DataColumn(label: Text('S')),
+                                  DataColumn(label: Text('X')),
+                                  DataColumn(label: Text('Y')),
+                                  DataColumn(label: Text('Z')),
+                                ],
+                                rows: _buildPointRows(),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              section(
+                Column(
+                  children: [
+                    TextField(
+                      controller: _hostController,
+                      decoration: const InputDecoration(
+                        labelText: 'Host',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _portController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Port',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _zController,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        signed: true,
+                        decimal: true,
+                      ),
+                      decoration: const InputDecoration(
+                        labelText: 'Z (mm)',
+                        isDense: true,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              section(
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        ElevatedButton(
+                          onPressed: _reset,
+                          child: const Text('Reset'),
+                        ),
+                        ElevatedButton(
+                          onPressed: _sendJson,
+                          child: const Text('Send'),
+                        ),
+                        ElevatedButton(
+                          onPressed: _deleteSelectedOrLast,
+                          child: const Text('Delete'),
+                        ),
+                        ElevatedButton(
+                          onPressed: _pickImage,
+                          child: const Text('Upload'),
+                        ),
+                        ElevatedButton(
+                          onPressed: _openStepViewer,
+                          child: const Text('STEP Viewer'),
+                        ),
+                        ElevatedButton(
+                          onPressed: _openOnshapeViewer,
+                          child: const Text('Onshape'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        ToggleButtons(
+                          isSelected: [
+                            _mode == DrawMode.line,
+                            _mode == DrawMode.pen,
+                            _mode == DrawMode.circle,
+                            _mode == DrawMode.rect,
+                          ],
+                          onPressed: (index) {
+                            setState(() {
+                              _mode = DrawMode.values[index];
+                              _clearCurrentDrawing();
+                            });
+                          },
+                          children: const [
+                            Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 12),
+                              child: Text('Line'),
+                            ),
+                            Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 12),
+                              child: Text('Pen'),
+                            ),
+                            Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 12),
+                              child: Text('Circle'),
+                            ),
+                            Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 12),
+                              child: Text('Rect'),
+                            ),
+                          ],
+                        ),
+                        FilterChip(
+                          label: const Text('Continue'),
+                          selected: _appendPen,
+                          onSelected: (value) {
+                            setState(() {
+                              _appendPen = value;
+                            });
+                          },
+                        ),
+                        FilterChip(
+                          label: const Text('Select'),
+                          selected: _selectMode,
+                          onSelected: (value) {
+                            setState(() {
+                              _selectMode = value;
+                              _isSelecting = false;
+                              _selectStart = null;
+                              _selectRect = null;
+                            });
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Text('Smooth', style: titleStyle),
+                    Slider(
+                      min: 1,
+                      max: 21,
+                      divisions: 10,
+                      label: _smoothingWindow.toString(),
+                      value: _smoothingWindow.toDouble(),
+                      onChanged: (value) {
+                        setState(() {
+                          var v = value.round();
+                          if (v.isEven) v += 1;
+                          _smoothingWindow = v.clamp(1, 21);
+                        });
+                        _applySmoothingToSelected();
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    Text('BG Size (mm)', style: titleStyle),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilterChip(
+                          label: const Text('A4'),
+                          selected: false,
+                          onSelected: (_) => _setPresetSize(297.0, 210.0),
+                        ),
+                        FilterChip(
+                          label: const Text('A2'),
+                          selected: false,
+                          onSelected: (_) => _setPresetSize(594.0, 420.0),
+                        ),
+                        FilterChip(
+                          label: const Text('B4'),
+                          selected: false,
+                          onSelected: (_) => _setPresetSize(353.0, 250.0),
+                        ),
+                        SizedBox(
+                          width: 110,
+                          child: TextField(
+                            controller: _bgWidthController,
+                            decoration: const InputDecoration(
+                              labelText: 'W',
+                              isDense: true,
+                            ),
+                            keyboardType:
+                            const TextInputType.numberWithOptions(decimal: true),
+                          ),
+                        ),
+                        SizedBox(
+                          width: 110,
+                          child: TextField(
+                            controller: _bgHeightController,
+                            decoration: const InputDecoration(
+                              labelText: 'H',
+                              isDense: true,
+                            ),
+                            keyboardType:
+                            const TextInputType.numberWithOptions(decimal: true),
+                          ),
+                        ),
+                        ElevatedButton(
+                          onPressed: _applyBackgroundSize,
+                          child: const Text('Apply Size'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text('Frame Scale', style: titleStyle),
+                    Slider(
+                      min: 0.5,
+                      max: 3.0,
+                      divisions: 25,
+                      label: _userFrameScale.toStringAsFixed(2),
+                      value: _userFrameScale,
+                      onChanged: (value) {
+                        setState(() {
+                          _userFrameScale = value;
+                          if (_userFrameMmSize != null) {
+                            _mmPerPx = 1.0;
+                            _mmPerPxController.text =
+                                _mmPerPx.toStringAsFixed(3);
+                          }
+                        });
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    Text('mm/px', style: titleStyle),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        SizedBox(
+                          width: 140,
+                          child: TextField(
+                            controller: _mmPerPxController,
+                            decoration: const InputDecoration(
+                              isDense: true,
+                              labelText: 'mm_per_px',
+                            ),
+                            keyboardType:
+                            const TextInputType.numberWithOptions(decimal: true),
+                          ),
+                        ),
+                        ElevatedButton(
+                          onPressed: _applyMmPerPx,
+                          child: const Text('Apply mm/px'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
   String _formatPointImage(Offset? p) {
     if (p == null) return '-';
     final mappedP = _canvasToImageClamped(p);
@@ -1190,14 +1353,17 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _openStepViewer() {
+    // STEP 뷰어 사이트 열기.
     _openWebViewer('STEP Viewer', 'https://3dviewer.net');
   }
 
   void _openOnshapeViewer() {
+    // Onshape 웹 열기.
     _openWebViewer('Onshape', 'https://cad.onshape.com');
   }
 
   void _openWebViewer(String title, String url) {
+    // 플랫폼에 따라 앱 내부 WebView 또는 외부 브라우저로 열기.
     if (Platform.isWindows ||
         defaultTargetPlatform == TargetPlatform.android ||
         defaultTargetPlatform == TargetPlatform.iOS) {
@@ -1212,6 +1378,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   Future<void> _launchExternalUrl(String url) async {
+    // 외부 브라우저로 URL 열기.
     final uri = Uri.parse(url);
     if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
       if (!mounted) return;
@@ -1223,6 +1390,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
 // ===== Point Table Rows (X,Y,Z 편집 가능) =====
   List<DataRow> _buildPointRows() {
+    // 포인트 테이블 UI용 행 생성 (X,Y는 표시, Z는 편집 가능).
     final source = _pointsForTable();
     final zValues = _zValuesForTable(source.length);
 
@@ -1251,7 +1419,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                 decoration: const InputDecoration(
                   isDense: true,
                   contentPadding:
-                      EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                  EdgeInsets.symmetric(horizontal: 6, vertical: 8),
                 ),
                 onChanged: (value) {
                   final parsed = double.tryParse(value.trim());
@@ -1270,6 +1438,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
   // ===== Table 대상 점들(Current 또는 선택 Stroke) =====
   List<Offset> _pointsForTable() {
+    // 테이블 표시 대상 포인트: 선택된 스트로크가 있으면 그 스트로크, 없으면 Current.
     if (_selectedStrokeIndex != null &&
         _selectedStrokeIndex! >= 0 &&
         _selectedStrokeIndex! < _strokes.length) {
@@ -1286,6 +1455,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
   // ===== Table 대상 Z(Current 또는 선택 Stroke) =====
   List<double> _zValuesForTable(int length) {
+    // 테이블 표시 대상 Z 리스트: 선택된 스트로크 우선, 아니면 Current.
     if (_selectedStrokeIndex != null &&
         _selectedStrokeIndex! >= 0 &&
         _selectedStrokeIndex! < _strokes.length) {
@@ -1307,6 +1477,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   double _lengthForMode() {
+    // 현재 모드의 길이(이미지 좌표 기준) 계산.
     if (_mode == DrawMode.line && _p0 != null && _p1 != null) {
       final p0Image = _canvasToImageClamped(_p0!);
       final p1Image = _canvasToImageClamped(_p1!);
@@ -1330,13 +1501,14 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
         return _polylineLength(_pointsImage);
       }
       final rawImage =
-          _rawPoints.map(_canvasToImageClamped).toList(growable: false);
+      _rawPoints.map(_canvasToImageClamped).toList(growable: false);
       return _polylineLength(rawImage);
     }
     return 0.0;
   }
 
   Size _fitFrameSize(Size imageSize, double maxWidth, double maxHeight) {
+    // 이미지 비율 유지하면서 프레임 내에 맞추기.
     final aspect = imageSize.width / imageSize.height;
     var width = maxWidth;
     var height = maxHeight;
@@ -1349,13 +1521,19 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   Offset _canvasToImageClamped(Offset p) {
+    // 캔버스 좌표 -> 프레임 로컬 좌표(좌상단이 0,0)로 변환 후 클램프.
     if (_frameRect == null) {
       return p;
     }
     final rect = _frameRect!;
     if (_userFrameMmSize != null || _imageSize == null) {
-      final x = (p.dx - rect.left).clamp(0.0, rect.width);
-      final y = (p.dy - rect.top).clamp(0.0, rect.height);
+      final logicalSize = _userFramePxSize ?? Size(rect.width, rect.height);
+      final localX = (p.dx - rect.left).clamp(0.0, rect.width);
+      final localY = (p.dy - rect.top).clamp(0.0, rect.height);
+      final x =
+      rect.width == 0 ? 0.0 : localX / rect.width * logicalSize.width;
+      final y =
+      rect.height == 0 ? 0.0 : localY / rect.height * logicalSize.height;
       return Offset(x.toDouble(), y.toDouble());
     }
     final sx = _imageSize!.width / rect.width;
@@ -1368,12 +1546,19 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   Offset _imageToCanvas(Offset p) {
+    // 프레임 로컬 좌표 -> 캔버스 좌표로 역변환.
     if (_frameRect == null) {
       return p;
     }
     final rect = _frameRect!;
     if (_userFrameMmSize != null || _imageSize == null) {
-      return Offset(rect.left + p.dx, rect.top + p.dy);
+      final logicalSize = _userFramePxSize ?? Size(rect.width, rect.height);
+      final x =
+      logicalSize.width == 0 ? 0.0 : p.dx / logicalSize.width * rect.width;
+      final y = logicalSize.height == 0
+          ? 0.0
+          : p.dy / logicalSize.height * rect.height;
+      return Offset(rect.left + x, rect.top + y);
     }
     final sx = rect.width / _imageSize!.width;
     final sy = rect.height / _imageSize!.height;
@@ -1381,6 +1566,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   List<Offset> _imagePointsToCanvas(List<Offset> points) {
+    // 프레임 로컬 좌표 리스트를 캔버스 좌표로 변환.
     if (_frameRect == null) {
       return points;
     }
@@ -1388,6 +1574,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _beginMove(Offset position) {
+    // 우클릭 이동 시작: 가장 가까운 스트로크를 잡는다.
     final index = _hitTestStroke(position);
     if (index == null) return;
     setState(() {
@@ -1399,6 +1586,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _updateMove(Offset position) {
+    // 이동 중: 델타만큼 스트로크 전체 이동.
     if (_dragStrokeIndex == null || _dragLast == null) return;
     final delta = position - _dragLast!;
     setState(() {
@@ -1408,6 +1596,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _endMove() {
+    // 이동 종료.
     setState(() {
       _dragStrokeIndex = null;
       _dragLast = null;
@@ -1415,12 +1604,14 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     });
   }
 
+  // Shift 키 상태 체크(샘플 점 편집 모드 진입용).
   bool _isShiftPressed() {
     final keys = HardwareKeyboard.instance.logicalKeysPressed;
     return keys.contains(LogicalKeyboardKey.shiftLeft) ||
         keys.contains(LogicalKeyboardKey.shiftRight);
   }
 
+  // 샘플 점 편집 시작: 가장 가까운 샘플을 선택한다.
   bool _beginEditPoint(Offset position) {
     final hit = _hitTestPoint(position);
     if (hit == null) return false;
@@ -1433,6 +1624,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return true;
   }
 
+  // 샘플 점 편집 중: 선택된 점을 이동.
   void _updateEditPoint(Offset position) {
     if (_editStrokeIndex == null) return;
     final stroke = _strokes[_editStrokeIndex!];
@@ -1450,6 +1642,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     });
   }
 
+  // 샘플 점 편집 종료.
   void _endEditPoint() {
     setState(() {
       _isEditingPoint = false;
@@ -1495,6 +1688,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return bestIndex;
   }
 
+  // 스트로크(선)과의 최소 거리로 선택 대상 찾기.
   int? _hitTestStroke(Offset position) {
     const threshold = 12.0;
     double best = double.infinity;
@@ -1510,6 +1704,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return null;
   }
 
+  // 점과 폴리라인 사이 최소 거리 계산.
   double _minDistanceToPath(List<Offset> path, Offset p) {
     if (path.isEmpty) return double.infinity;
     if (path.length == 1) return (p - path.first).distance;
@@ -1521,6 +1716,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return min;
   }
 
+  // 점과 선분 사이 최소 거리 계산.
   double _distanceToSegment(Offset p, Offset a, Offset b) {
     final ab = b - a;
     final ap = p - a;
@@ -1532,6 +1728,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return (p - closest).distance;
   }
 
+  // 스트로크 전체를 이동(드래그 이동).
   void _translateStroke(Stroke stroke, Offset delta) {
     for (var i = 0; i < stroke.path.length; i++) {
       stroke.path[i] = stroke.path[i] + delta;
@@ -1541,6 +1738,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     }
   }
 
+  // 현재 그리기 중인 임시 상태를 초기화.
   void _clearActiveDrawing() {
     _p0 = null;
     _p1 = null;
@@ -1553,6 +1751,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   Offset _clampToFrame(Offset position) {
+    // 프레임 밖으로 나가지 않도록 강제 클램프.
     final rect = _frameRect;
     if (rect == null) return position;
     final x = position.dx.clamp(rect.left, rect.right).toDouble();
@@ -1561,6 +1760,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _selectStrokeByRect(Rect rect) {
+    // 드래그 박스로 겹치는 스트로크 중 가장 가까운 것을 선택.
     int? bestIndex;
     double bestScore = double.infinity;
     for (var i = 0; i < _strokes.length; i++) {
@@ -1587,6 +1787,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   bool _strokeIntersectsRect(Stroke stroke, Rect rect) {
+    // 스트로크가 선택 사각형과 교차하는지 검사.
     for (final p in stroke.path) {
       if (rect.contains(p)) return true;
     }
@@ -1599,6 +1800,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   bool _segmentIntersectsRect(Offset a, Offset b, Rect rect) {
+    // 선분과 사각형 교차 여부.
     if (rect.contains(a) || rect.contains(b)) return true;
     final tl = rect.topLeft;
     final tr = rect.topRight;
@@ -1611,6 +1813,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   bool _segmentsIntersect(Offset p1, Offset p2, Offset q1, Offset q2) {
+    // 두 선분 교차 여부(벡터 외적 기반).
     double cross(Offset a, Offset b, Offset c) {
       return (b.dx - a.dx) * (c.dy - a.dy) -
           (b.dy - a.dy) * (c.dx - a.dx);
@@ -1628,6 +1831,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   void _applySmoothingToSelected() {
+    // 선택한 스트로크에 이동 평균 스무딩 적용.
     if (_selectedStrokeIndex == null ||
         _selectedStrokeIndex! < 0 ||
         _selectedStrokeIndex! >= _strokes.length ||
@@ -1650,9 +1854,10 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 
   List<Offset> _smoothPoints(List<Offset> points) {
+    // ??? ?? ?? ???.
     if (points.length < 3) return points;
     final window =
-        _smoothingWindow.isOdd ? _smoothingWindow : _smoothingWindow + 1;
+    _smoothingWindow.isOdd ? _smoothingWindow : _smoothingWindow + 1;
     final half = window ~/ 2;
     final original = List<Offset>.from(points);
     final result = List<Offset>.from(points);
@@ -1675,6 +1880,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   }
 }
 
+// 캔버스에 선/점/선택 사각형을 그리는 페인터.
 class LinePainter extends CustomPainter {
   LinePainter({
     required this.p0,
@@ -1700,6 +1906,7 @@ class LinePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // 프레임 영역 내에서 스트로크/포인트를 그린다.
     if (frameRect != null) {
       canvas.save();
       canvas.clipRect(frameRect!);
@@ -1725,11 +1932,11 @@ class LinePainter extends CustomPainter {
       final isSelected = selectedStrokeIndex == i;
       final paint = isSelected
           ? (Paint()
-            ..color = Colors.orange
-            ..strokeWidth = 3
-            ..style = PaintingStyle.stroke
-            ..strokeCap = StrokeCap.round
-            ..strokeJoin = StrokeJoin.round)
+        ..color = Colors.orange
+        ..strokeWidth = 3
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round)
           : linePaint;
 
       _drawStrokeIndex(canvas, size, stroke, i, strokeLabelStyle);
@@ -1746,7 +1953,7 @@ class LinePainter extends CustomPainter {
       final stroke = strokes[i];
       final isSelected = selectedStrokeIndex == i;
       final pPaint =
-          isSelected ? (Paint()..color = Colors.orangeAccent) : pointPaint;
+      isSelected ? (Paint()..color = Colors.orangeAccent) : pointPaint;
       for (final p in stroke.samples) {
         canvas.drawCircle(p, 3, pPaint);
       }
@@ -1817,12 +2024,12 @@ class LinePainter extends CustomPainter {
   }
 
   void _drawStrokeIndex(
-    Canvas canvas,
-    Size size,
-    Stroke stroke,
-    int index,
-    TextStyle style,
-  ) {
+      Canvas canvas,
+      Size size,
+      Stroke stroke,
+      int index,
+      TextStyle style,
+      ) {
     if (stroke.path.isEmpty) return;
     final first = stroke.path.first;
     final textPainter = TextPainter(
@@ -1836,9 +2043,11 @@ class LinePainter extends CustomPainter {
   }
 }
 
+// 그리기 모드 종류.
 enum DrawMode { line, pen, circle, rect }
 
 class Stroke {
+  // 하나의 스트로크(선/펜)를 구성하는 데이터.
   Stroke({required this.path, required this.samples, required this.zValues});
 
   List<Offset> path;
@@ -1864,6 +2073,7 @@ class _PointHit {
 }
 
 class WebViewerPage extends StatefulWidget {
+  // 외부 웹 페이지를 앱 내부에서 보여주는 간단한 뷰어.
   const WebViewerPage({super.key, required this.title, required this.url});
 
   final String title;
@@ -1874,6 +2084,7 @@ class WebViewerPage extends StatefulWidget {
 }
 
 class _WebViewerPageState extends State<WebViewerPage> {
+  // 플랫폼별 WebView 컨트롤러.
   WebViewController? _mobileController;
   final WebviewController _windowsController = WebviewController();
   bool _windowsReady = false;
@@ -1892,6 +2103,7 @@ class _WebViewerPageState extends State<WebViewerPage> {
   }
 
   Future<void> _initWindowsWebView() async {
+    // Windows WebView 초기화 및 URL 로드.
     try {
       await _windowsController.initialize();
       await _windowsController.loadUrl(widget.url);
@@ -1917,6 +2129,7 @@ class _WebViewerPageState extends State<WebViewerPage> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows / 모바일 플랫폼에 따라 WebView 구현을 분기한다.
     Widget body;
     if (Platform.isWindows) {
       if (_windowsError != null) {

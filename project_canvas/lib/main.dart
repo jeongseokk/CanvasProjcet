@@ -118,6 +118,8 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
   final TextEditingController _portController =
       TextEditingController(text: _defaultPort.toString());
   final TextEditingController _zController = TextEditingController(text: '0.0');
+  final TextEditingController _pointCountController =
+      TextEditingController(text: '0');
   final TextEditingController _mmPerPxController =
       TextEditingController(text: _defaultMmPerPx.toStringAsFixed(3));
   final TextEditingController _bgWidthController = TextEditingController();
@@ -140,6 +142,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     _userFramePxSize = const Size(594.0, 420.0);
     _mmPerPx = 1.0 / _userFrameScale;
     _mmPerPxController.text = _mmPerPx.toStringAsFixed(3);
+    _syncPointCountController();
   }
 
   @override
@@ -147,6 +150,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     _hostController.dispose();
     _portController.dispose();
     _zController.dispose();
+    _pointCountController.dispose();
     _mmPerPxController.dispose();
     _bgWidthController.dispose();
     _bgHeightController.dispose();
@@ -167,6 +171,101 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       _mmPerPx = value;
       _status = 'mm_per_px applied';
     });
+  }
+
+  void _applyZToAll() {
+    final value = double.tryParse(_zController.text.trim());
+    if (value == null) {
+      setState(() {
+        _status = 'Z invalid';
+      });
+      return;
+    }
+
+    setState(() {
+      if (_strokes.isNotEmpty) {
+        if (_selectedStrokeIndex != null &&
+            _selectedStrokeIndex! >= 0 &&
+            _selectedStrokeIndex! < _strokes.length) {
+          final stroke = _strokes[_selectedStrokeIndex!];
+          stroke.zValues = List<double>.filled(stroke.samples.length, value);
+          _status = 'Applied Z to S$_selectedStrokeIndex';
+        } else {
+          for (final stroke in _strokes) {
+            stroke.zValues = List<double>.filled(stroke.samples.length, value);
+          }
+          _status = 'Applied Z to all strokes';
+        }
+      } else {
+        _currentZValues = List<double>.filled(_pointsMm.length, value);
+        _status = 'Applied Z to current points';
+      }
+    });
+  }
+
+  void _applyPointCount() {
+    final value = int.tryParse(_pointCountController.text.trim());
+    if (value == null || value <= 0) {
+      setState(() {
+        _status = 'Point count invalid';
+      });
+      return;
+    }
+
+    setState(() {
+      if (_selectedStrokeIndex != null &&
+          _selectedStrokeIndex! >= 0 &&
+          _selectedStrokeIndex! < _strokes.length) {
+        _replaceStrokeWithPointCount(_selectedStrokeIndex!, value);
+        _status = 'Applied point count to S$_selectedStrokeIndex';
+      } else if (_strokes.isNotEmpty) {
+        _replaceStrokeWithPointCount(_strokes.length - 1, value);
+        _selectedStrokeIndex = _strokes.length - 1;
+        _status = 'Applied point count to last stroke';
+      } else if (_pointsPx.isNotEmpty) {
+        if (_pointsImage.isNotEmpty) {
+          _pointsImage = _resamplePolylineByCount(_pointsImage, value);
+          _pointsPx = _imagePointsToCanvas(_pointsImage);
+        } else {
+          _pointsPx = _resamplePolylineByCount(_pointsPx, value);
+          _pointsImage =
+              _pointsPx.map(_canvasToImageClamped).toList(growable: false);
+        }
+        _pointsMm = _applyTransform(_pointsImage, _mmPerPx);
+        _deltasMm = _buildDeltas(_pointsMm);
+        _currentZValues = _syncZList(_currentZValues, _pointsMm.length);
+        _status = 'Applied point count to current points';
+      } else {
+        _status = 'No points to resample';
+      }
+
+      _syncPointCountController();
+    });
+  }
+
+  void _replaceStrokeWithPointCount(int strokeIndex, int pointCount) {
+    final stroke = _strokes[strokeIndex];
+    final shouldResamplePath = stroke.path.length == stroke.samples.length;
+    final nextPath = shouldResamplePath
+        ? _resamplePolylineByCount(stroke.path, pointCount)
+        : List<Offset>.from(stroke.path);
+    final nextSamples = _resamplePolylineByCount(
+      shouldResamplePath ? nextPath : stroke.path,
+      pointCount,
+    );
+
+    final replacement = Stroke(
+      path: nextPath,
+      samples: nextSamples,
+      zValues: _syncZList(stroke.zValues, nextSamples.length),
+    )
+      ..basePath = List<Offset>.from(nextPath)
+      ..baseSamples = List<Offset>.from(nextSamples);
+
+    _strokes[strokeIndex] = replacement;
+    if (_smoothingBaseStrokeIndex == strokeIndex) {
+      _smoothingBaseStrokeIndex = strokeIndex;
+    }
   }
 
   void _applyBackgroundSize() {
@@ -379,6 +478,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
           stroke.path.addAll(path);
           stroke.samples.addAll(samples);
           stroke.zValues.addAll(List<double>.filled(samples.length, 0.0));
+          _selectedStrokeIndex = _appendStrokeIndex;
         } else {
           _strokes.add(
             Stroke(
@@ -387,7 +487,9 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
               zValues: List<double>.filled(samples.length, 0.0),
             ),
           );
+          _selectedStrokeIndex = _strokes.length - 1;
         }
+        _clearActiveDrawing();
       }
       _appendStrokeIndex = null;
     });
@@ -414,6 +516,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       _deltasMm = <Offset>[];
       _currentZValues = <double>[];
       _status = 'Reset';
+      _syncPointCountController();
     });
   }
 
@@ -429,6 +532,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       _currentZValues = <double>[];
       _appendStrokeIndex = null;
       _isDrawing = false;
+      _syncPointCountController();
     });
   }
 
@@ -448,6 +552,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
         _strokes.removeLast();
       }
       _clearCurrentDrawing();
+      _syncPointCountController();
     });
   }
 
@@ -639,6 +744,84 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return list;
   }
 
+  List<Offset> _resamplePolylineByCount(List<Offset> input, int pointCount) {
+    if (input.isEmpty) return <Offset>[];
+    if (pointCount <= 1) return <Offset>[input.first];
+    if (input.length == 1) {
+      return List<Offset>.filled(pointCount, input.first);
+    }
+
+    final cumulative = <double>[0.0];
+    var total = 0.0;
+    for (var i = 1; i < input.length; i++) {
+      total += (input[i] - input[i - 1]).distance;
+      cumulative.add(total);
+    }
+
+    if (total == 0.0) {
+      return List<Offset>.filled(pointCount, input.first);
+    }
+
+    final result = <Offset>[];
+    var segmentIndex = 1;
+
+    for (var i = 0; i < pointCount; i++) {
+      final target = total * i / (pointCount - 1);
+      while (segmentIndex < cumulative.length - 1 &&
+          cumulative[segmentIndex] < target) {
+        segmentIndex++;
+      }
+
+      final start = input[segmentIndex - 1];
+      final end = input[segmentIndex];
+      final startDistance = cumulative[segmentIndex - 1];
+      final endDistance = cumulative[segmentIndex];
+      final segmentLength = endDistance - startDistance;
+
+      if (segmentLength == 0.0) {
+        result.add(start);
+        continue;
+      }
+
+      final t = (target - startDistance) / segmentLength;
+      result.add(Offset(
+        start.dx + (end.dx - start.dx) * t,
+        start.dy + (end.dy - start.dy) * t,
+      ));
+    }
+
+    return result;
+  }
+
+  void _syncPointCountController() {
+    int count = 0;
+    if (_selectedStrokeIndex != null &&
+        _selectedStrokeIndex! >= 0 &&
+        _selectedStrokeIndex! < _strokes.length) {
+      count = _strokes[_selectedStrokeIndex!].samples.length;
+    } else if (_pointsPx.isNotEmpty) {
+      count = _pointsPx.length;
+    } else if (_strokes.isNotEmpty) {
+      count = _strokes.last.samples.length;
+    }
+
+    final text = count.toString();
+    if (_pointCountController.text == text) return;
+    _pointCountController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+  }
+
+  int _displayPointCount() {
+    if (_selectedStrokeIndex != null &&
+        _selectedStrokeIndex! >= 0 &&
+        _selectedStrokeIndex! < _strokes.length) {
+      return _strokes[_selectedStrokeIndex!].samples.length;
+    }
+    return _pointsPx.length;
+  }
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////
   void _rebuildPoints() {
     // 현재 모드에 맞는 포인트를 다시 생성하고
@@ -652,6 +835,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       _pointsMm = <Offset>[];
       _deltasMm = <Offset>[];
       _currentZValues = <double>[];
+      _syncPointCountController();
       return;
     }
 
@@ -700,6 +884,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
       _pointsMm = <Offset>[];
       _deltasMm = <Offset>[];
       _currentZValues = <double>[];
+      _syncPointCountController();
       return;
     }
 
@@ -708,6 +893,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
 
     // ✅ Current Z 길이 동기화(기본 0)
     _currentZValues = _syncZList(_currentZValues, _pointsMm.length);
+    _syncPointCountController();
   }
 
   List<Offset> _toRelativePoints(List<Offset> points, Offset origin) {
@@ -992,7 +1178,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                           Text('Start: ${_formatPointImage(_p0)}'),
                           Text('End: ${_formatPointImage(_p1)}'),
                           Text('Length(img px): ${lengthPx.toStringAsFixed(2)}'),
-                          Text('Points: ${_pointsPx.length}'),
+                          Text('Points: ${_displayPointCount()}'),
                           Text('Status: $_status'),
                         ],
                       ),
@@ -1020,6 +1206,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                                     onChanged: (value) {
                                       setState(() {
                                         _selectedStrokeIndex = value;
+                                        _syncPointCountController();
                                       });
                                     },
                                     isDense: true,
@@ -1045,7 +1232,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                                           DataColumn(label: Text('Y')),
                                           DataColumn(label: Text('Z')),
                                         ],
-                                        rows: _buildPointRows(),
+                                        rows: _buildPointRowsForAndroidZ(),
                                       ),
                                     ),
                                   ),
@@ -1087,9 +1274,28 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                               decimal: true,
                             ),
                             decoration: const InputDecoration(
-                              labelText: 'Z (mm)',
+                              labelText: 'Z All',
                               isDense: true,
                             ),
+                          ),
+                          const SizedBox(height: 8),
+                          ElevatedButton(
+                            onPressed: _applyZToAll,
+                            child: const Text('Apply Z All'),
+                          ),
+                          const SizedBox(height: 8),
+                          TextField(
+                            controller: _pointCountController,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'Point Count',
+                              isDense: true,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          ElevatedButton(
+                            onPressed: _applyPointCount,
+                            child: const Text('Apply Points'),
                           ),
                         ],
                       ),
@@ -1108,7 +1314,6 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
                     ElevatedButton(onPressed: _sendJson, child: const Text('Send')),
                     ElevatedButton(onPressed: _deleteSelectedOrLast, child: const Text('Delete')),
                     ElevatedButton(onPressed: _pickImage, child: const Text('Upload')),
-                    ElevatedButton(onPressed: _openStepViewer, child: const Text('STEP Viewer')),
                     ElevatedButton(onPressed: _openOnshapeViewer, child: const Text('Onshape')),
 
                     const SizedBox(width: 6),
@@ -1394,6 +1599,122 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     return _currentZValues;
   }
 
+  List<DataRow> _buildPointRowsForAndroidZ() {
+    final rows = _tableRowsForAndroidZ();
+
+    if (rows.isEmpty) return const <DataRow>[];
+
+    return List<DataRow>.generate(rows.length, (index) {
+      final row = rows[index];
+
+      return DataRow(
+        cells: [
+          DataCell(Text(row.label)),
+          DataCell(Text(row.point.dx.toStringAsFixed(2))),
+          DataCell(Text(row.point.dy.toStringAsFixed(2))),
+          DataCell(
+            SizedBox(
+              width: 70,
+              child: TextFormField(
+                key: ValueKey<String>(
+                    'z-${row.label}-${row.z.toStringAsFixed(2)}'),
+                initialValue: row.z.toStringAsFixed(2),
+                keyboardType: const TextInputType.numberWithOptions(
+                  signed: true,
+                  decimal: true,
+                ),
+                decoration: const InputDecoration(
+                  isDense: true,
+                  contentPadding:
+                      EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                ),
+                onChanged: (value) {
+                  final parsed = double.tryParse(value.trim());
+                  if (parsed == null) return;
+                  setState(() {
+                    if (row.strokeIndex != null) {
+                      final stroke = _strokes[row.strokeIndex!];
+                      stroke.zValues = _syncZList(
+                        stroke.zValues,
+                        stroke.samples.length,
+                      );
+                      stroke.zValues[row.pointIndex] = parsed;
+                    } else {
+                      _currentZValues =
+                          _syncZList(_currentZValues, _pointsMm.length);
+                      _currentZValues[row.pointIndex] = parsed;
+                    }
+                  });
+                },
+              ),
+            ),
+          ),
+        ],
+      );
+    });
+  }
+
+  List<_TablePointRow> _tableRowsForAndroidZ() {
+    if (_selectedStrokeIndex != null &&
+        _selectedStrokeIndex! >= 0 &&
+        _selectedStrokeIndex! < _strokes.length) {
+      final stroke = _strokes[_selectedStrokeIndex!];
+      final imagePoints = stroke.samples
+          .map(_canvasToImageClamped)
+          .toList(growable: false);
+      final points = _applyTransform(imagePoints, _mmPerPx);
+      stroke.zValues = _syncZList(stroke.zValues, points.length);
+      return List<_TablePointRow>.generate(points.length, (index) {
+        return _TablePointRow(
+          label: 'S${_selectedStrokeIndex!}-$index',
+          point: points[index],
+          z: stroke.zValues[index],
+          pointIndex: index,
+          strokeIndex: _selectedStrokeIndex,
+        );
+      });
+    }
+
+    if (_strokes.isNotEmpty) {
+      final rows = <_TablePointRow>[];
+      for (var strokeIndex = 0; strokeIndex < _strokes.length; strokeIndex++) {
+        final stroke = _strokes[strokeIndex];
+        final imagePoints = stroke.samples
+            .map(_canvasToImageClamped)
+            .toList(growable: false);
+        final points = _applyTransform(imagePoints, _mmPerPx);
+        stroke.zValues = _syncZList(stroke.zValues, points.length);
+        for (var pointIndex = 0; pointIndex < points.length; pointIndex++) {
+          rows.add(
+            _TablePointRow(
+              label: 'S$strokeIndex-$pointIndex',
+              point: points[pointIndex],
+              z: stroke.zValues[pointIndex],
+              pointIndex: pointIndex,
+              strokeIndex: strokeIndex,
+            ),
+          );
+          _selectedStrokeIndex = _strokes.length - 1;
+        }
+        _syncPointCountController();
+      }
+      return rows;
+    }
+
+    final points = _pointsMm.isNotEmpty
+        ? _pointsMm
+        : (_pointsImage.isNotEmpty ? _pointsImage : _pointsPx);
+    _currentZValues = _syncZList(_currentZValues, points.length);
+    return List<_TablePointRow>.generate(points.length, (index) {
+      return _TablePointRow(
+        label: 'C$index',
+        point: points[index],
+        z: _currentZValues[index],
+        pointIndex: index,
+      );
+    });
+  }
+
   double _polylineLength(List<Offset> points) {
     if (points.length < 2) return 0.0;
     var sum = 0.0;
@@ -1664,6 +1985,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     _pointsMm = <Offset>[];
     _deltasMm = <Offset>[];
     _currentZValues = <double>[];
+    _syncPointCountController();
   }
 
   Offset _clampToFrame(Offset position) {
@@ -1691,6 +2013,7 @@ class _CanvasHomePageState extends State<CanvasHomePage> {
     }
     setState(() {
       _selectedStrokeIndex = bestIndex;
+      _syncPointCountController();
       if (bestIndex != null) {
         final stroke = _strokes[bestIndex];
         stroke.basePath = List<Offset>.from(stroke.path);
@@ -1917,15 +2240,7 @@ class LinePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant LinePainter oldDelegate) {
-    return oldDelegate.p0 != p0 ||
-        oldDelegate.p1 != p1 ||
-        oldDelegate.points != points ||
-        oldDelegate.rawPoints != rawPoints ||
-        oldDelegate.mode != mode ||
-        oldDelegate.strokes != strokes ||
-        oldDelegate.selectRect != selectRect ||
-        oldDelegate.selectedStrokeIndex != selectedStrokeIndex ||
-        oldDelegate.frameRect != frameRect;
+    return true;
   }
 
   void _drawPointIndices(Canvas canvas, List<Offset> points, TextStyle style) {
@@ -1986,6 +2301,22 @@ class _PointHit {
   final int strokeIndex;
   final int sampleIndex;
   final int? pathIndex;
+}
+
+class _TablePointRow {
+  _TablePointRow({
+    required this.label,
+    required this.point,
+    required this.z,
+    required this.pointIndex,
+    this.strokeIndex,
+  });
+
+  final String label;
+  final Offset point;
+  final double z;
+  final int pointIndex;
+  final int? strokeIndex;
 }
 
 class WebViewerPage extends StatefulWidget {

@@ -1,0 +1,60 @@
+
+# 1) 소켓 수신
+
+sock = server_socket_open(50000)
+_, rx_data = server_socket_read(sock)
+rx_msg = rx_data.decode()
+server_socket_close(sock)
+
+# 2) 문자열 정리
+rx_msg = rx_msg.replace("\r", "").replace("\n", "").replace(" ", "")
+
+# 3) points 부분만 잘라내기
+# {"points":[[x,y,z],[x,y,z],[0],...]}
+points_str = rx_msg.split('"points":[')[1].rstrip("]}")
+
+# 4) 현재 로봇 자세
+rx_current_pos, _ = get_current_posx(ref=101)
+a, b, c = rx_current_pos[3], rx_current_pos[4], rx_current_pos[5]
+
+# 5) points 파싱
+pose_list = []
+
+# 각 [] 단위로 분리
+raw_points = points_str.split("],[")
+
+for rp in raw_points:
+    rp = rp.replace("[", "").replace("]", "")
+    rp = rp.replace('"', '')
+    #tp_popup("rp=<{}>".format(rp))
+    # [0] 구분자 스킵
+
+    if rp == "000":
+        pose_list.append("BREAK")
+        continue
+
+    vals = rp.split(",")
+    if len(vals) != 3:
+        continue
+
+    x = float(vals[0])
+    y = float(vals[1])
+    z = float(vals[2])
+
+    pose_list.append([x, y, z, a, b, c])
+
+# 6) 확인
+tp_popup("pose_list = {}".format(pose_list))
+up = 1
+for move in pose_list:
+    if move == "BREAK":
+        movel([0,0,-100,0,0,0], ref = 101, mod = DR_MV_MOD_REL)
+        up = 1
+    elif up == 1:
+        app = trans(move,[0,0,-100,0,0,0], 101,101)
+        movel(app, ref = 101)
+        up = 0
+    tp_log("{}".format(move))
+    if move != "BREAK":
+        move_app = trans(move,[0,0,-1,0,0,0], 101,101)
+        movel(move_app, ref = 101)
